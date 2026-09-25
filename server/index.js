@@ -28,6 +28,17 @@ function sendError(res, status, message) {
   return res.status(status).json(payload);
 }
 
+/**
+ * 把 store 返回的错误对象转成 JSON 响应：优先使用其自带 status，
+ * 并透传可识别的 code（如落盘失败 PERSIST_FAILED）与 currentVersion。
+ */
+function sendStoreError(res, result, fallbackStatus) {
+  const payload = { error: result.error };
+  if (result.code) payload.code = result.code;
+  if (result.currentVersion !== undefined) payload.currentVersion = result.currentVersion;
+  return sendError(res, result.status || fallbackStatus, payload);
+}
+
 /** 统一的输入校验：从请求体取非空字符串字段 */
 function requireId(body, field) {
   const value = body && typeof body[field] === 'string' ? body[field].trim() : '';
@@ -49,7 +60,7 @@ app.post('/api/members', (req, res) => {
   const name = normalizeName(req.body && req.body.name);
   if (!name) return sendError(res, 400, '姓名不能为空');
   const result = store.addMember(name);
-  if (result.error) return sendError(res, 400, result.error);
+  if (result.error) return sendStoreError(res, result, 400);
   res.status(201).json(store.list());
 });
 
@@ -58,14 +69,14 @@ app.patch('/api/members/:id', (req, res) => {
   const name = normalizeName(req.body && req.body.name);
   if (!name) return sendError(res, 400, '姓名不能为空');
   const result = store.renameMember(req.params.id, name);
-  if (result.error) return sendError(res, 404, result.error);
+  if (result.error) return sendStoreError(res, result, 404);
   res.json(store.list());
 });
 
 /** 删除成员（级联删除相关关系；纪念日随成员一并删除） */
 app.delete('/api/members/:id', (req, res) => {
   const result = store.deleteMember(req.params.id);
-  if (result.error) return sendError(res, 404, result.error);
+  if (result.error) return sendStoreError(res, result, 404);
   res.json(store.list());
 });
 
@@ -78,7 +89,7 @@ app.delete('/api/members/:id', (req, res) => {
  */
 app.put('/api/members/:id/anniversaries', (req, res) => {
   const result = store.setAnniversaries(req.params.id, req.body);
-  if (result.error) return sendError(res, result.status || 400, result.error);
+  if (result.error) return sendStoreError(res, result, 400);
   res.json(store.list());
 });
 
@@ -116,7 +127,7 @@ app.post('/api/edges', (req, res) => {
   if (check.error) return sendError(res, 400, check.error);
 
   const result = store.addEdge(parentId, childId);
-  if (result.error) return sendError(res, 400, result.error);
+  if (result.error) return sendStoreError(res, result, 400);
   res.status(201).json(store.list());
 });
 
@@ -126,7 +137,7 @@ app.delete('/api/edges', (req, res) => {
   const childId = requireId(req.body, 'childId');
   if (!parentId || !childId) return sendError(res, 400, '缺少关系参数');
   const result = store.deleteEdge(parentId, childId);
-  if (result.error) return sendError(res, 404, result.error);
+  if (result.error) return sendStoreError(res, result, 404);
   res.json(store.list());
 });
 
@@ -273,6 +284,7 @@ app.post('/api/edges/batch', (req, res) => {
   const result = store.commitEdges(edges, expectedVersion);
   if (result.error) {
     const payload = { error: result.error };
+    if (result.code) payload.code = result.code;
     if (result.currentVersion !== undefined) payload.currentVersion = result.currentVersion;
     // 非法条目明细一并返回，便于前端展示每条错误
     if (result.result) payload.preview = decorateBatchResult(result.result);
@@ -377,6 +389,7 @@ app.post('/api/members/merge', (req, res) => {
   const result = store.commitMerge(keepId, mergeId, req.body && req.body.version);
   if (result.error) {
     const payload = { error: result.error };
+    if (result.code) payload.code = result.code;
     if (result.currentVersion !== undefined) payload.currentVersion = result.currentVersion;
     if (result.result) payload.preview = decorateMergeResult(result.result);
     return sendError(res, result.status || 400, payload);
@@ -395,11 +408,7 @@ app.post('/api/members/merge', (req, res) => {
  */
 app.post('/api/undo', (req, res) => {
   const result = store.undoLast(req.body && req.body.version);
-  if (result.error) {
-    const payload = { error: result.error };
-    if (result.currentVersion !== undefined) payload.currentVersion = result.currentVersion;
-    return sendError(res, result.status || 409, payload);
-  }
+  if (result.error) return sendStoreError(res, result, 409);
   res.json({ ...store.list(), undone: result.label });
 });
 
@@ -460,6 +469,7 @@ app.post('/api/backup/restore', (req, res) => {
   const result = store.restoreBackup(body.content, body.fingerprint, body.version);
   if (result.error) {
     const payload = { error: result.error };
+    if (result.code) payload.code = result.code;
     if (result.currentVersion !== undefined) payload.currentVersion = result.currentVersion;
     if (result.errors) payload.errors = result.errors;
     return sendError(res, result.status || 400, payload);
@@ -601,9 +611,20 @@ app.use((err, req, res, next) => {
   return next(err);
 });
 
-app.listen(PORT, HOST, () => {
-  console.log(`家谱关系核对应用已启动: http://localhost:${PORT}`);
-  console.log(`数据文件: ${DATA_FILE}`);
+/** 未预期错误兜底：始终返回可识别的 JSON 错误（而非 Express 默认的 HTML 错误页） */
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  console.error('未预期的服务器错误:', err);
+  return sendError(res, 500, { error: `服务器内部错误：${err.message}`, code: 'INTERNAL_ERROR' });
 });
+
+// 直接运行（node server/index.js / npm start / Docker CMD）时启动监听；
+// 被测试 require 时只导出 app，由测试自行监听随机端口。
+if (require.main === module) {
+  app.listen(PORT, HOST, () => {
+    console.log(`家谱关系核对应用已启动: http://localhost:${PORT}`);
+    console.log(`数据文件: ${DATA_FILE}`);
+  });
+}
 
 module.exports = app;
