@@ -28,6 +28,18 @@ function sendError(res, status, message) {
   return res.status(status).json(payload);
 }
 
+/**
+ * 发送 store 层错误：HTTP 状态取 result.status（缺省 fallbackStatus），
+ * JSON 体保留可识别的 code（如写盘失败 PERSIST_FAILED）与 currentVersion，
+ * 调用方据此区分「数据未落盘」与「校验失败 / 版本冲突」。
+ */
+function sendStoreError(res, result, fallbackStatus = 400) {
+  const payload = { error: result.error };
+  if (result.code) payload.code = result.code;
+  if (result.currentVersion !== undefined) payload.currentVersion = result.currentVersion;
+  return res.status(result.status || fallbackStatus).json(payload);
+}
+
 /** 统一的输入校验：从请求体取非空字符串字段 */
 function requireId(body, field) {
   const value = body && typeof body[field] === 'string' ? body[field].trim() : '';
@@ -49,7 +61,7 @@ app.post('/api/members', (req, res) => {
   const name = normalizeName(req.body && req.body.name);
   if (!name) return sendError(res, 400, '姓名不能为空');
   const result = store.addMember(name);
-  if (result.error) return sendError(res, 400, result.error);
+  if (result.error) return sendStoreError(res, result);
   res.status(201).json(store.list());
 });
 
@@ -58,14 +70,14 @@ app.patch('/api/members/:id', (req, res) => {
   const name = normalizeName(req.body && req.body.name);
   if (!name) return sendError(res, 400, '姓名不能为空');
   const result = store.renameMember(req.params.id, name);
-  if (result.error) return sendError(res, 404, result.error);
+  if (result.error) return sendStoreError(res, result, 404);
   res.json(store.list());
 });
 
 /** 删除成员（级联删除相关关系；纪念日随成员一并删除） */
 app.delete('/api/members/:id', (req, res) => {
   const result = store.deleteMember(req.params.id);
-  if (result.error) return sendError(res, 404, result.error);
+  if (result.error) return sendStoreError(res, result, 404);
   res.json(store.list());
 });
 
@@ -78,7 +90,7 @@ app.delete('/api/members/:id', (req, res) => {
  */
 app.put('/api/members/:id/anniversaries', (req, res) => {
   const result = store.setAnniversaries(req.params.id, req.body);
-  if (result.error) return sendError(res, result.status || 400, result.error);
+  if (result.error) return sendStoreError(res, result);
   res.json(store.list());
 });
 
@@ -116,7 +128,7 @@ app.post('/api/edges', (req, res) => {
   if (check.error) return sendError(res, 400, check.error);
 
   const result = store.addEdge(parentId, childId);
-  if (result.error) return sendError(res, 400, result.error);
+  if (result.error) return sendStoreError(res, result);
   res.status(201).json(store.list());
 });
 
@@ -126,7 +138,7 @@ app.delete('/api/edges', (req, res) => {
   const childId = requireId(req.body, 'childId');
   if (!parentId || !childId) return sendError(res, 400, '缺少关系参数');
   const result = store.deleteEdge(parentId, childId);
-  if (result.error) return sendError(res, 404, result.error);
+  if (result.error) return sendStoreError(res, result, 404);
   res.json(store.list());
 });
 
@@ -273,6 +285,7 @@ app.post('/api/edges/batch', (req, res) => {
   const result = store.commitEdges(edges, expectedVersion);
   if (result.error) {
     const payload = { error: result.error };
+    if (result.code) payload.code = result.code;
     if (result.currentVersion !== undefined) payload.currentVersion = result.currentVersion;
     // 非法条目明细一并返回，便于前端展示每条错误
     if (result.result) payload.preview = decorateBatchResult(result.result);
@@ -377,6 +390,7 @@ app.post('/api/members/merge', (req, res) => {
   const result = store.commitMerge(keepId, mergeId, req.body && req.body.version);
   if (result.error) {
     const payload = { error: result.error };
+    if (result.code) payload.code = result.code;
     if (result.currentVersion !== undefined) payload.currentVersion = result.currentVersion;
     if (result.result) payload.preview = decorateMergeResult(result.result);
     return sendError(res, result.status || 400, payload);
@@ -397,6 +411,7 @@ app.post('/api/undo', (req, res) => {
   const result = store.undoLast(req.body && req.body.version);
   if (result.error) {
     const payload = { error: result.error };
+    if (result.code) payload.code = result.code;
     if (result.currentVersion !== undefined) payload.currentVersion = result.currentVersion;
     return sendError(res, result.status || 409, payload);
   }
@@ -460,6 +475,7 @@ app.post('/api/backup/restore', (req, res) => {
   const result = store.restoreBackup(body.content, body.fingerprint, body.version);
   if (result.error) {
     const payload = { error: result.error };
+    if (result.code) payload.code = result.code;
     if (result.currentVersion !== undefined) payload.currentVersion = result.currentVersion;
     if (result.errors) payload.errors = result.errors;
     return sendError(res, result.status || 400, payload);

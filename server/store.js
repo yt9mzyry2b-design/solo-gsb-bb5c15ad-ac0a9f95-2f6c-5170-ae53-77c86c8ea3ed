@@ -3,6 +3,13 @@
 /**
  * JSON 文件持久化：启动时读取，每次变更后同步写入（先写临时文件再 rename）。
  *
+ * 写盘顺序（先落盘、后发布）：每次变更先在当前状态的深拷贝（候选家谱）上应用，
+ * 并抓取「变更前的完整家谱」作为撤销快照；候选家谱、新版本与快照完整写入磁盘
+ * （临时文件 + rename）成功后，才发布到内存。临时文件写入或重命名失败时，
+ * 内存中的成员、关系、纪念日、版本与最近一次撤销信息全部保持原值，
+ * 本次临时文件被清理，请求返回可识别的 PERSIST_FAILED 错误（HTTP 500），
+ * 恢复写盘条件后可再次提交。普通变更、备份恢复与撤销都遵守此规则。
+ *
  * 家谱版本 version：每次成功变更（成员增删改、关系增删/批量提交、合并、撤销）单调 +1，
  * 并随数据落盘。批量预检返回当时的 version，提交时必须原样带回；
  * 预检与提交之间家谱若被其他操作改动，version 不匹配则整批拒绝。
@@ -68,10 +75,13 @@ function createStore(filePath) {
   }
 
   /**
-   * 所有成功写入的统一入口：
-   * 先抓取「变更前的完整家谱」作为唯一可撤销快照（覆盖旧快照），
-   * 再应用 mutate 对内存状态做修改，随后版本 +1，把新状态、新版本与撤销快照
-   * 写入同一个 JSON 文件（临时文件 + rename，原子落盘）。
+   * 所有成功写入的统一入口（先落盘、后发布）：
+   * 1. 抓取「变更前的完整家谱」作为唯一可撤销快照（覆盖旧快照）；
+   * 2. 在当前状态的深拷贝（候选家谱）上应用 mutate——内存状态保持不动；
+   * 3. 把候选家谱、新版本与撤销快照写入同一个 JSON 文件（临时文件 + rename，原子落盘）；
+   * 4. 落盘完整成功后，才把候选家谱、新版本与快照发布到内存。
+   * 写盘失败时内存中的成员、关系、纪念日、版本与撤销快照全部保持原值，
+   * 返回可识别的 PERSIST_FAILED 错误；恢复写盘条件后可再次提交。
    * 校验必须在调用本函数之前完成，mutate 不应再返回错误。
    */
   function commit(label, mutate) {
@@ -81,15 +91,26 @@ function createStore(filePath) {
       version,
       family: serializeFamily(),
     };
-    mutate();
+    // 候选家谱：当前状态的深拷贝，变更只作用于候选
+    const candidate = cloneState(state);
+    mutate(candidate);
+    try {
+      writeFile(filePath, version + 1, candidate, snapshot);
+    } catch (err) {
+      return persistFailure(err);
+    }
+    // 落盘成功才发布到内存
+    state = candidate;
     version += 1;
     undo = snapshot;
-    writeFile(filePath, version, state, undo);
+    return { error: null };
   }
 
   /**
    * 撤销最近一次成功写入：恢复快照中的完整家谱（成员 ID、姓名与关系原貌），
-   * 撤销本身推进版本且清空快照，与新状态原子落盘；重启后同样可用。
+   * 撤销本身推进版本且清空快照。同样遵守「先落盘、后发布」：
+   * 恢复后的家谱、推进后的版本与清空的快照先完整落盘，成功后才发布到内存；
+   * 写盘失败时家谱、版本与可撤销快照全部保持原值，恢复写盘条件后可再次撤销。
    * 携带的 expectedVersion 必须等于当前版本（乐观锁，与批量/合并提交一致）：
    * 其他标签页已修改家谱（版本不符）时返回 409 且数据保持不变。
    */
@@ -109,11 +130,15 @@ function createStore(filePath) {
     }
     const restored = familyToState(undo.family);
     const label = undo.label;
-    // 一次写入：恢复状态、推进版本、清空快照
+    // 一次落盘：恢复状态、推进版本、清空快照；成功后才发布到内存
+    try {
+      writeFile(filePath, version + 1, restored, null);
+    } catch (err) {
+      return persistFailure(err);
+    }
     state = restored;
     version += 1;
     undo = null;
-    writeFile(filePath, version, state, undo);
     return { error: null, label };
   }
 
@@ -141,10 +166,11 @@ function createStore(filePath) {
       return { error: `成员数量上限为 ${state.maxMembers} 人，无法继续添加` };
     }
     const member = { id: crypto.randomUUID(), name, birthday: null, deathday: null };
-    commit(`添加成员「${name}」`, () => {
-      state.members.push(member);
-      state.parentsOf[member.id] = [];
+    const result = commit(`添加成员「${name}」`, (draft) => {
+      draft.members.push(member);
+      draft.parentsOf[member.id] = [];
     });
+    if (result.error) return result;
     return { error: null, member };
   }
 
@@ -154,10 +180,11 @@ function createStore(filePath) {
     const member = state.members.find((m) => m.id === id);
     if (!member) return { error: '成员不存在' };
     const previousName = member.name;
-    commit(`重命名成员「${previousName}」→「${name}」`, () => {
-      member.name = name;
+    const result = commit(`重命名成员「${previousName}」→「${name}」`, (draft) => {
+      draft.members.find((m) => m.id === id).name = name;
     });
-    return { error: null, member };
+    if (result.error) return result;
+    return { error: null, member: state.members.find((m) => m.id === id) };
   }
 
   /**
@@ -194,33 +221,37 @@ function createStore(filePath) {
     const label = cleared
       ? `清除「${member.name}」的纪念日`
       : `更新「${member.name}」的纪念日（生日 ${monthDayLabel(next.birthday)} · 忌日 ${monthDayLabel(next.deathday)}）`;
-    commit(label, () => {
-      member.birthday = next.birthday;
-      member.deathday = next.deathday;
+    const result = commit(label, (draft) => {
+      const target = draft.members.find((m) => m.id === id);
+      target.birthday = next.birthday;
+      target.deathday = next.deathday;
     });
-    return { error: null, member };
+    if (result.error) return result;
+    return { error: null, member: state.members.find((m) => m.id === id) };
   }
 
   /** 删除成员：同时移除以其为父母或子女的全部边（级联）；纪念日随成员一并删除 */
   function deleteMember(id) {
     const member = state.members.find((m) => m.id === id);
     if (!member) return { error: '成员不存在' };
-    commit(`删除成员「${member.name}」及其关系`, () => {
-      state.members = state.members.filter((m) => m.id !== id);
-      delete state.parentsOf[id];
-      for (const childId of Object.keys(state.parentsOf)) {
-        state.parentsOf[childId] = state.parentsOf[childId].filter((p) => p !== id);
+    const result = commit(`删除成员「${member.name}」及其关系`, (draft) => {
+      draft.members = draft.members.filter((m) => m.id !== id);
+      delete draft.parentsOf[id];
+      for (const childId of Object.keys(draft.parentsOf)) {
+        draft.parentsOf[childId] = draft.parentsOf[childId].filter((p) => p !== id);
       }
     });
+    if (result.error) return result;
     return { error: null };
   }
 
   function addEdge(parentId, childId) {
     const check = validateEdge(state, parentId, childId);
     if (check.error) return check;
-    commit(`建立关系「${memberName(parentId)} → ${memberName(childId)}」`, () => {
-      state.parentsOf[childId].push(parentId);
+    const result = commit(`建立关系「${memberName(parentId)} → ${memberName(childId)}」`, (draft) => {
+      draft.parentsOf[childId].push(parentId);
     });
+    if (result.error) return result;
     return { error: null };
   }
 
@@ -229,9 +260,10 @@ function createStore(filePath) {
     if (!parents || !parents.includes(parentId)) {
       return { error: '关系不存在' };
     }
-    commit(`删除关系「${memberName(parentId)} → ${memberName(childId)}」`, () => {
-      state.parentsOf[childId] = parents.filter((p) => p !== parentId);
+    const result = commit(`删除关系「${memberName(parentId)} → ${memberName(childId)}」`, (draft) => {
+      draft.parentsOf[childId] = draft.parentsOf[childId].filter((p) => p !== parentId);
     });
+    if (result.error) return result;
     return { error: null };
   }
 
@@ -272,9 +304,10 @@ function createStore(filePath) {
       seen.add(key);
       toAdd.push(item);
     }
-    commit(`批量建立 ${toAdd.length} 条关系`, () => {
-      for (const item of toAdd) state.parentsOf[item.childId].push(item.parentId);
+    const committed = commit(`批量建立 ${toAdd.length} 条关系`, (draft) => {
+      for (const item of toAdd) draft.parentsOf[item.childId].push(item.parentId);
     });
+    if (committed.error) return committed;
     return { error: null };
   }
 
@@ -316,15 +349,16 @@ function createStore(filePath) {
     const keepName = memberName(keepId);
     const mergeName = memberName(mergeId);
     const mergedEdges = result.edges.map((e) => ({ parentId: e.parentId, childId: e.childId }));
-    commit(`合并成员「${mergeName}」到「${keepName}」`, () => {
+    const committed = commit(`合并成员「${mergeName}」到「${keepName}」`, (draft) => {
       // 一次应用：重建父母邻接表 + 删除被合并成员（保留成员姓名不动）
-      state.members = state.members.filter((m) => m.id !== mergeId);
-      for (const childId of Object.keys(state.parentsOf)) delete state.parentsOf[childId];
-      for (const m of state.members) state.parentsOf[m.id] = [];
+      draft.members = draft.members.filter((m) => m.id !== mergeId);
+      for (const childId of Object.keys(draft.parentsOf)) delete draft.parentsOf[childId];
+      for (const m of draft.members) draft.parentsOf[m.id] = [];
       for (const e of mergedEdges) {
-        state.parentsOf[e.childId].push(e.parentId);
+        draft.parentsOf[e.childId].push(e.parentId);
       }
     });
+    if (committed.error) return committed;
     return { error: null };
   }
 
@@ -398,9 +432,13 @@ function createStore(filePath) {
     }
 
     const restored = stateFromValidBackup(check.members, check.edges, state.maxMembers);
-    commit(`恢复备份（${check.memberCount} 名成员、${check.edgeCount} 条关系）`, () => {
-      state = restored;
+    const committed = commit(`恢复备份（${check.memberCount} 名成员、${check.edgeCount} 条关系）`, (draft) => {
+      // 以备份整体替换候选家谱
+      draft.maxMembers = restored.maxMembers;
+      draft.members = restored.members;
+      draft.parentsOf = restored.parentsOf;
     });
+    if (committed.error) return committed;
     return { error: null };
   }
 
@@ -424,7 +462,10 @@ function createStore(filePath) {
   };
 }
 
-/** 统一落盘：新状态 + 新版本 + 唯一撤销快照写入同一文件（临时文件 + rename） */
+/** 统一落盘：新状态 + 新版本 + 唯一撤销快照写入同一文件（临时文件 + rename）。
+ * 临时文件写入或重命名失败时，清理本次临时文件并抛错——
+ * 调用方遵守「先落盘、后发布」，此时内存状态尚未改动。
+ */
 function writeFile(filePath, version, state, undo) {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
@@ -447,8 +488,48 @@ function writeFile(filePath, version, state, undo) {
         }
       : null,
   };
-  fs.writeFileSync(tmp, JSON.stringify(snapshot, null, 2), 'utf8');
-  fs.renameSync(tmp, filePath);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(snapshot, null, 2), 'utf8');
+    fs.renameSync(tmp, filePath);
+  } catch (err) {
+    // 清理本次临时文件（可能尚未创建或只写了一半），避免残留
+    try {
+      fs.unlinkSync(tmp);
+    } catch (_) {
+      /* 临时文件不存在或无法删除时忽略 */
+    }
+    throw err;
+  }
+}
+
+/** 写盘失败的统一错误（可识别：HTTP 500 + code = PERSIST_FAILED）；内存状态保持原值 */
+function persistFailure(err) {
+  const reason = err && (err.code || err.message) ? `（${err.code || err.message}）` : '';
+  return {
+    error: `家谱数据写入磁盘失败，本次变更未生效，请检查数据目录可写后重试${reason}`,
+    status: 500,
+    code: 'PERSIST_FAILED',
+  };
+}
+
+/**
+ * 当前内存状态的深拷贝（候选家谱的起点）。
+ * 不做加载净化：运行时状态已由写入前的校验保证合法，原样复制即可。
+ */
+function cloneState(src) {
+  const parentsOf = {};
+  for (const [childId, parents] of Object.entries(src.parentsOf)) {
+    parentsOf[childId] = [...parents];
+  }
+  return {
+    maxMembers: src.maxMembers,
+    members: src.members.map((m) => ({
+      id: m.id,
+      name: m.name,
+      ...serializeAnniversaries(m),
+    })),
+    parentsOf,
+  };
 }
 
 function edgesList(state) {
